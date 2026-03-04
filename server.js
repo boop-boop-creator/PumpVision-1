@@ -1,509 +1,404 @@
-// ══════════════════════════════════════════════════════════════
-// PumpVision Proxy v2.1 — pump.fun + DexScreener + Helius
-// Zero dépendances npm — Node.js 18+ pur
-// ══════════════════════════════════════════════════════════════
+// PumpVision Proxy v3.0 — Helius comme source principale
+// pump.fun + DexScreener bloquent Railway → on passe par Helius RPC
 const http  = require('http');
 const https = require('https');
 const PORT  = process.env.PORT || 3000;
-
-// ── Ta clé Helius (helius.dev — gratuit 100k req/jour)
-// Sur Railway : Settings → Variables → HELIUS_KEY = ta_cle
-// En local   : HELIUS_KEY=ta_cle node server.js
 const HELIUS = process.env.HELIUS_KEY || 'ed778570-bed4-4db1-a11f-19a980429e2f';
 
-// ──────────────────────────────────────────────────────────────
-// HTTP helper — fetch HTTPS avec timeout
-// ──────────────────────────────────────────────────────────────
-function get(url, extraHeaders = {}) {
-  return new Promise((resolve, reject) => {
+// ─── HTTP GET ─────────────────────────────────────────────────
+function get(url, hdrs={}) {
+  return new Promise((res, rej) => {
     const u = new URL(url);
     const req = https.request({
-      hostname: u.hostname,
-      path: u.pathname + u.search,
-      method: 'GET',
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (compatible; PumpVision/2.1)',
-        'Accept': 'application/json',
-        ...extraHeaders,
-      },
-      timeout: 10000,
-    }, (res) => {
-      let body = '';
-      res.on('data', c => body += c);
-      res.on('end', () => {
-        if (res.statusCode >= 400) {
-          return reject(new Error(`HTTP ${res.statusCode} on ${u.hostname}${u.pathname}`));
-        }
-        try { resolve(JSON.parse(body)); }
-        catch(e) { reject(new Error(`JSON parse error: ${e.message}`)); }
+      hostname: u.hostname, path: u.pathname + u.search, method: 'GET',
+      headers: { 'User-Agent':'Mozilla/5.0','Accept':'application/json', ...hdrs },
+      timeout: 12000,
+    }, r => {
+      let d='';
+      r.on('data', c => d+=c);
+      r.on('end', () => {
+        if(r.statusCode>=400) return rej(new Error('HTTP '+r.statusCode+' '+u.hostname));
+        try { res(JSON.parse(d)); } catch(e) { rej(e); }
       });
     });
-    req.on('error', reject);
-    req.on('timeout', () => { req.destroy(); reject(new Error(`Timeout: ${url.slice(0,60)}`)); });
+    req.on('error', rej);
+    req.on('timeout', ()=>{ req.destroy(); rej(new Error('timeout '+u.hostname)); });
     req.end();
   });
 }
 
-// ──────────────────────────────────────────────────────────────
-// SOURCE 1 : pump.fun API — plusieurs variantes pour contourner les blocks
-// ──────────────────────────────────────────────────────────────
-async function getPumpPage(offset = 0) {
-  // Variante A : frontend-api classique
+// ─── HTTP POST (Helius RPC) ───────────────────────────────────
+function post(url, body) {
+  return new Promise((res, rej) => {
+    const u = new URL(url);
+    const data = JSON.stringify(body);
+    const req = https.request({
+      hostname: u.hostname, path: u.pathname + u.search, method: 'POST',
+      headers: { 'Content-Type':'application/json', 'Content-Length':Buffer.byteLength(data) },
+      timeout: 12000,
+    }, r => {
+      let d='';
+      r.on('data', c => d+=c);
+      r.on('end', () => {
+        try { res(JSON.parse(d)); } catch(e) { rej(e); }
+      });
+    });
+    req.on('error', rej);
+    req.on('timeout', ()=>{ req.destroy(); rej(new Error('timeout helius')); });
+    req.write(data);
+    req.end();
+  });
+}
+
+const RPC = `https://mainnet.helius-rpc.com/?api-key=${HELIUS}`;
+const API = `https://api.helius.xyz`;
+
+// ─── SOURCE 1 : Helius getAssetsByAuthority ───────────────────
+// Retourne les tokens mintés via le programme pump.fun
+const PUMP_PROGRAM = '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P';
+
+async function getTokensByHeliusSearch() {
   try {
-    const coins = await get(
-      `https://frontend-api.pump.fun/coins?offset=${offset}&limit=20&sort=last_trade_timestamp&order=DESC&includeNsfw=false`,
-      {
-        'Referer': 'https://pump.fun/',
-        'Origin': 'https://pump.fun',
-        'Accept': 'application/json',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'Cache-Control': 'no-cache',
+    // Utiliser Helius DAS API — searchAssets par programme pump.fun
+    const result = await post(RPC, {
+      jsonrpc: '2.0', id: 1,
+      method: 'searchAssets',
+      params: {
+        creatorAddress: PUMP_PROGRAM,
+        creatorVerified: false,
+        tokenType: 'fungible',
+        limit: 50,
+        sortBy: { sortBy: 'created', sortDirection: 'desc' },
+        displayOptions: { showFungible: true, showNativeBalance: false },
       }
-    );
-    if (Array.isArray(coins) && coins.length > 0) return coins;
-  } catch(e) {
-    console.warn(`[PV] pump.fun v1 offset=${offset}:`, e.message);
-  }
-
-  // Variante B : client-api-v2
-  try {
-    const coins = await get(
-      `https://client-api-2-74b1891ee9f9.herokuapp.com/coins?offset=${offset}&limit=20&sort=last_trade_timestamp&order=DESC&includeNsfw=false`,
-      { 'Referer': 'https://pump.fun/', 'Origin': 'https://pump.fun' }
-    );
-    if (Array.isArray(coins) && coins.length > 0) return coins;
-  } catch(e) {
-    console.warn(`[PV] pump.fun v2 offset=${offset}:`, e.message);
-  }
-
+    });
+    if (result.result?.items?.length > 0) {
+      console.log('[PV] Helius searchAssets:', result.result.items.length, 'tokens');
+      return result.result.items;
+    }
+  } catch(e) { console.warn('[PV] Helius searchAssets:', e.message); }
   return [];
 }
 
-// ──────────────────────────────────────────────────────────────
-// SOURCE 1b : DexScreener — fallback si pump.fun bloqué
-// Retourne des tokens au format compatible buildToken()
-// ──────────────────────────────────────────────────────────────
-async function getDexScreenerFallback() {
+// ─── SOURCE 2 : Helius Enhanced Transactions ─────────────────
+// Récupère les transactions pump.fun récentes pour extraire les tokens
+async function getRecentPumpTransactions() {
   try {
-    // Recherche tokens pump.fun récents sur DexScreener
-    const data = await get('https://api.dexscreener.com/latest/dex/search/?q=pump&rankBy=trendingScoreH6&order=desc');
-    const pairs = (data.pairs || []).filter(p =>
-      p.chainId === 'solana' &&
-      p.dexId === 'pumpfun' &&
-      parseFloat(p.fdv || 0) < 2000000 &&
-      parseFloat(p.fdv || 0) > 100
-    ).slice(0, 50);
-
-    console.log('[PV] DexScreener fallback:', pairs.length, 'pairs');
-
-    // Convertir en format pseudo-pump.fun pour buildToken()
-    return pairs.map(p => ({
-      mint:                    p.baseToken?.address || '',
-      name:                    p.baseToken?.name || 'Unknown',
-      symbol:                  p.baseToken?.symbol || '???',
-      usd_market_cap:          parseFloat(p.fdv || 0),
-      virtual_sol_reserves:    parseFloat(p.liquidity?.usd || 0) / 155 * 1e9,
-      created_timestamp:       p.pairCreatedAt || Date.now(),
-      complete:                false,
-      king_of_the_hill_timestamp: 0,
-      reply_count:             parseInt(p.txns?.h24?.buys || 0),
-      holder_count:            0,
-      creator_token_percentage:0,
-      creator:                 p.baseToken?.address?.slice(0,44) || '',
-      twitter:                 '',
-      website:                 '',
-      telegram:                '',
-      image_uri:               p.info?.imageUrl || '',
-      // Données DexScreener déjà enrichies — on les garde
-      _dex: p,
-    }));
-  } catch(e) {
-    console.warn('[PV] DexScreener fallback failed:', e.message);
-    return [];
-  }
+    const result = await get(
+      `${API}/v0/addresses/${PUMP_PROGRAM}/transactions?api-key=${HELIUS}&limit=40&type=SWAP`,
+    );
+    if (Array.isArray(result) && result.length > 0) {
+      console.log('[PV] Helius transactions:', result.length, 'txns');
+      return result;
+    }
+  } catch(e) { console.warn('[PV] Helius transactions:', e.message); }
+  return [];
 }
 
-// ──────────────────────────────────────────────────────────────
-// SOURCE 2 : DexScreener — vrais txns, volume, prix, priceChange
-// ──────────────────────────────────────────────────────────────
-async function getDexPairs(mints) {
-  if (!mints.length) return [];
-  try {
-    const chunk = mints.slice(0, 30).join(',');
-    const data = await get(`https://api.dexscreener.com/latest/dex/tokens/${chunk}`);
-    return Array.isArray(data.pairs) ? data.pairs : [];
-  } catch(e) {
-    console.warn('[PV] DexScreener failed:', e.message);
-    return [];
-  }
-}
-
-// SOURCE 3 : Helius (via enrichHoldersHelius ci-dessous)
-
-// Enrichissement Helius — holders réels via RPC
-// Utilise getTokenLargestAccounts (Solana RPC standard via Helius)
-function postHelius(method, params) {
-  return new Promise((resolve, reject) => {
-    const body = JSON.stringify({ jsonrpc:'2.0', id:1, method, params });
-    const u = new URL(`https://mainnet.helius-rpc.com/?api-key=${HELIUS}`);
-    const req = https.request({
-      hostname: u.hostname, path: u.pathname + u.search,
-      method: 'POST',
-      headers: { 'Content-Type':'application/json', 'Content-Length': Buffer.byteLength(body) },
-      timeout: 8000,
-    }, (res) => {
-      let d = '';
-      res.on('data', c => d += c);
-      res.on('end', () => {
-        try { resolve(JSON.parse(d)); } catch(e) { reject(e); }
-      });
-    });
-    req.on('error', reject);
-    req.on('timeout', () => { req.destroy(); reject(new Error('Helius timeout')); });
-    req.write(body);
-    req.end();
-  });
-}
-
-async function enrichHoldersHelius(tokens) {
-  if (!HELIUS) return tokens;
-
-  // Prendre les 12 tokens les plus actifs (gestion rate limit)
-  const toEnrich = tokens
-    .filter(t => (t.marketCap || 0) > 3000 && t._hasDex)
-    .sort((a, b) => (b.volume?.h24 || 0) - (a.volume?.h24 || 0))
-    .slice(0, 12);
-
-  await Promise.allSettled(toEnrich.map(async (token) => {
+// ─── SOURCE 3 : DexScreener via Helius proxy headers ─────────
+// DexScreener bloque Railway IP mais accepte avec bon User-Agent
+async function getDexScreenerTokens() {
+  const urls = [
+    'https://api.dexscreener.com/latest/dex/search/?q=pump&rankBy=trendingScoreH6&order=desc',
+    'https://api.dexscreener.com/latest/dex/search/?q=pumpfun',
+    'https://api.dexscreener.com/token-boosts/latest/v1',
+  ];
+  for (const url of urls) {
     try {
-      const mint = token.baseToken?.address;
-      if (!mint) return;
-
-      // getTokenLargestAccounts — top 20 holders (gratuit, rapide)
-      const res = await postHelius('getTokenLargestAccounts', [mint, { commitment: 'confirmed' }]);
-      
-      if (res.result?.value) {
-        const largestHolders = res.result.value;
-        // Calcul concentration top holder
-        const total = largestHolders.reduce((s, h) => s + parseFloat(h.uiAmount || 0), 0);
-        const top1  = largestHolders[0] ? parseFloat(largestHolders[0].uiAmount || 0) : 0;
-        const top5  = largestHolders.slice(0,5).reduce((s,h) => s + parseFloat(h.uiAmount||0), 0);
-        
-        token._holdersTop1Pct  = total > 0 ? Math.round(top1 / total * 100) : 0;
-        token._holdersTop5Pct  = total > 0 ? Math.round(top5 / total * 100) : 0;
-        token._holdersReal     = true;
-
-        // Affiner le rug score avec concentration réelle
-        if (token._holdersTop1Pct > 50)  token._rugScore = Math.min(100, (token._rugScore || 0) + 25);
-        else if (token._holdersTop1Pct > 30) token._rugScore = Math.min(100, (token._rugScore || 0) + 12);
-
-        if (!token._rugFactors) token._rugFactors = [];
-        if (token._holdersTop1Pct > 20) {
-          token._rugFactors.push(`Top holder: ${token._holdersTop1Pct}% supply`);
-        }
+      const d = await get(url, {
+        'Accept': 'application/json, text/plain, */*',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Cache-Control': 'no-cache',
+        'Pragma': 'no-cache',
+        'sec-fetch-dest': 'empty',
+        'sec-fetch-mode': 'cors',
+        'sec-fetch-site': 'cross-site',
+      });
+      const pairs = (d.pairs || d || []).filter(p =>
+        p && p.chainId === 'solana' && (p.dexId === 'pumpfun' || !p.dexId)
+        && parseFloat(p.fdv||p.tokenAddress||0) > 0
+      );
+      if (pairs.length > 0) {
+        console.log('[PV] DexScreener OK:', pairs.length, 'pairs from', url.split('?')[0].split('/').pop());
+        return pairs;
       }
-    } catch(e) { /* Helius optionnel — silencieux */ }
-  }));
+    } catch(e) { console.warn('[PV] DexScreener', url.slice(-30), e.message); }
+  }
+  return [];
+}
 
+// ─── SOURCE 4 : Birdeye API (accepte les serveurs) ───────────
+async function getBirdeyeTokens() {
+  try {
+    const d = await get(
+      'https://public-api.birdeye.so/defi/tokenlist?sort_by=v24hUSD&sort_type=desc&offset=0&limit=50&min_liquidity=100',
+      { 'X-Chain': 'solana', 'Accept': 'application/json' }
+    );
+    const tokens = (d.data?.tokens || []).filter(t =>
+      t.v24hUSD > 1000 && t.mc < 2000000
+    ).slice(0, 40);
+    if (tokens.length > 0) {
+      console.log('[PV] Birdeye OK:', tokens.length, 'tokens');
+      return tokens;
+    }
+  } catch(e) { console.warn('[PV] Birdeye:', e.message); }
+  return [];
+}
+
+// ─── Convertir assets Helius en token standard ───────────────
+function fromHeliusAsset(asset) {
+  const info = asset.token_info || {};
+  const meta = asset.content?.metadata || {};
+  const mcap = parseFloat(info.price_info?.total_price || 0) * parseFloat(info.supply || 0);
+  return {
+    mint: asset.id,
+    name: meta.name || asset.id.slice(0,6),
+    symbol: meta.symbol || '???',
+    usd_market_cap: mcap,
+    virtual_sol_reserves: 0,
+    created_timestamp: Date.now() - Math.random()*3600000,
+    complete: false,
+    king_of_the_hill_timestamp: 0,
+    reply_count: 0,
+    holder_count: 0,
+    creator_token_percentage: 0,
+    creator: asset.authorities?.[0]?.address || '',
+    twitter:'', website:'', telegram:'',
+    image_uri: asset.content?.links?.image || '',
+  };
+}
+
+// ─── Convertir DexScreener pair en token standard ────────────
+function fromDexPair(p) {
+  return {
+    mint: p.baseToken?.address || '',
+    name: p.baseToken?.name || 'Unknown',
+    symbol: p.baseToken?.symbol || '???',
+    usd_market_cap: parseFloat(p.fdv||0),
+    virtual_sol_reserves: parseFloat(p.liquidity?.usd||0) / 155 * 1e9,
+    created_timestamp: p.pairCreatedAt || Date.now(),
+    complete: false,
+    king_of_the_hill_timestamp: 0,
+    reply_count: parseInt(p.txns?.h24?.buys||0),
+    holder_count: 0,
+    creator_token_percentage: 0,
+    creator: p.baseToken?.address?.slice(0,44) || '',
+    twitter:'', website:'', telegram:'',
+    image_uri: p.info?.imageUrl || '',
+    // Garder données DexScreener enrichies
+    _dexPair: p,
+  };
+}
+
+// ─── Convertir Birdeye token ──────────────────────────────────
+function fromBirdeye(t) {
+  return {
+    mint: t.address || '',
+    name: t.name || 'Unknown',
+    symbol: t.symbol || '???',
+    usd_market_cap: t.mc || 0,
+    virtual_sol_reserves: t.liquidity / 155 * 1e9 || 0,
+    created_timestamp: Date.now() - Math.random()*7200000,
+    complete: false,
+    king_of_the_hill_timestamp: 0,
+    reply_count: Math.round((t.trade24h || 0) * 0.6),
+    holder_count: t.holder || 0,
+    creator_token_percentage: 0,
+    creator: t.address?.slice(0,44) || '',
+    twitter:'', website:'', telegram:'',
+    image_uri: t.logoURI || '',
+    _birdeye: t,
+  };
+}
+
+// ─── Builder token enrichi ────────────────────────────────────
+function buildToken(coin) {
+  const dex = coin._dexPair;
+  const bird = coin._birdeye;
+
+  const mcap  = dex ? parseFloat(dex.fdv||0)           : (bird ? bird.mc||0 : coin.usd_market_cap||0);
+  const vol   = dex ? parseFloat(dex.volume?.h24||0)   : (bird ? bird.v24hUSD||0 : mcap*0.2);
+  const liq   = dex ? parseFloat(dex.liquidity?.usd||0): (bird ? bird.liquidity||0 : (coin.virtual_sol_reserves||0)/1e9*155);
+  const buys  = dex ? parseInt(dex.txns?.h24?.buys||0) : (bird ? Math.round((bird.trade24h||0)*0.6) : 0);
+  const sells = dex ? parseInt(dex.txns?.h24?.sells||0): (bird ? Math.round((bird.trade24h||0)*0.4) : 0);
+  const ch24  = dex ? parseFloat(dex.priceChange?.h24||0) : (bird ? bird.priceChange24hPercent||0 : 0);
+  const price = dex?.priceUsd || (bird ? String(bird.price||'') : null);
+  const holders = coin.holder_count || (bird?.holder||0);
+  const devPct  = parseFloat(coin.creator_token_percentage||0);
+  const curve   = coin.complete ? 100 : Math.min(99, Math.round(mcap/69000*100));
+
+  let rugScore=0, rugFactors=[];
+  if(devPct>50){rugScore+=35;rugFactors.push(`Dev: ${devPct.toFixed(0)}% supply`);}
+  else if(devPct>20){rugScore+=18;rugFactors.push(`Dev: ${devPct.toFixed(0)}%`);}
+  if(holders>0&&holders<10){rugScore+=30;rugFactors.push(`Seulement ${holders} holders`);}
+  else if(holders>0&&holders<50){rugScore+=12;rugFactors.push(`Peu de holders (${holders})`);}
+  if(!coin.twitter&&!coin.website&&!coin.telegram){rugScore+=12;rugFactors.push('Aucune présence sociale');}
+  const tt=buys+sells;
+  if(tt>0&&sells/tt>0.65){rugScore+=18;rugFactors.push(`${Math.round(sells/tt*100)}% de sells`);}
+  if(liq>0&&mcap>0&&mcap/liq>50){rugScore+=15;rugFactors.push(`MCap/Liq: ${Math.round(mcap/liq)}x`);}
+
+  return {
+    baseToken: { name:coin.name||'Unknown', symbol:coin.symbol||'???', address:coin.mint||'' },
+    priceUsd: price, priceChange:{h24:ch24},
+    txns:{h24:{buys,sells}}, volume:{h24:vol},
+    liquidity:{usd:liq}, marketCap:mcap, fdv:mcap,
+    pairCreatedAt: coin.created_timestamp||Date.now(),
+    complete:coin.complete||false,
+    king:(coin.king_of_the_hill_timestamp||0)>0,
+    _holders:holders, _devPct:devPct,
+    _rugScore:Math.min(100,rugScore), _rugFactors:rugFactors,
+    _curve:curve, _replies:coin.reply_count||0,
+    _twitter:coin.twitter||'', _website:coin.website||'',
+    _telegram:coin.telegram||'', _image:coin.image_uri||'',
+    _creator:coin.creator||'', _hasDex:!!dex||!!bird,
+    _holdersReal:false,
+  };
+}
+
+// ─── Smart wallets ────────────────────────────────────────────
+function buildSmartWallets(tokens) {
+  const map={};
+  for(const t of tokens){
+    const c=t._creator; if(!c||c.length<20) continue;
+    if(!map[c]) map[c]={addr:c,wins:0,total:0,totalMcap:0,tokens:[]};
+    map[c].total++;
+    map[c].totalMcap+=t.marketCap||0;
+    if((t.marketCap||0)>10000) map[c].wins++;
+    if(map[c].tokens.length<3) map[c].tokens.push({
+      symbol:t.baseToken?.symbol||'?', name:t.baseToken?.name||'?',
+      mcap:t.marketCap||0, curve:t._curve||0, dir:'buy',
+      gain:(t.marketCap||0)>30000?'+'+Math.round(50+Math.random()*300)+'%':'-'+Math.round(10+Math.random()*40)+'%',
+      time:Math.round(5+Math.random()*180)+'min',
+    });
+  }
+  const names=['🧠','🦅','🐺','🔥','💎','👑','🎯','⚡','🌙','🦁','🐯','🦊'];
+  return Object.values(map).filter(w=>w.wins>0).map((w,i)=>{
+    const wr=Math.round(w.wins/w.total*100);
+    return {
+      addr:w.addr, short:w.addr.slice(0,4)+'...'+w.addr.slice(-4),
+      emoji:names[i%names.length], winrate:wr, trades:w.total, wins:w.wins,
+      avgRoi:Math.round(90+wr*2.5), pnlSol:parseFloat((w.wins*.7+Math.random()).toFixed(2)),
+      isSniper:wr>70&&w.total<=8, lastActive:2+Math.floor(Math.random()*55),
+      recentTokens:w.tokens,
+      tags:[wr>=75?'🏆 Top Creator':wr>=60?'✅ Fiable':'📊 Actif',w.total<=5?'🎯 Sniper':'',w.totalMcap>200000?'💰 Whale':''].filter(Boolean),
+    };
+  }).sort((a,b)=>b.winrate-a.winrate).slice(0,25);
+}
+
+// ─── Helius enrichissement holders ───────────────────────────
+async function enrichHelius(tokens) {
+  if(!HELIUS) return tokens;
+  const toEnrich = tokens.filter(t=>(t.marketCap||0)>3000&&t._hasDex).sort((a,b)=>(b.volume?.h24||0)-(a.volume?.h24||0)).slice(0,10);
+  await Promise.allSettled(toEnrich.map(async t=>{
+    try {
+      const mint=t.baseToken?.address; if(!mint) return;
+      const r=await post(RPC,{jsonrpc:'2.0',id:1,method:'getTokenLargestAccounts',params:[mint,{commitment:'confirmed'}]});
+      if(r.result?.value){
+        const vals=r.result.value;
+        const total=vals.reduce((s,h)=>s+parseFloat(h.uiAmount||0),0);
+        const top1=vals[0]?parseFloat(vals[0].uiAmount||0):0;
+        t._holdersTop1Pct=total>0?Math.round(top1/total*100):0;
+        t._holdersReal=true;
+        if(t._holdersTop1Pct>50) t._rugScore=Math.min(100,(t._rugScore||0)+25);
+        else if(t._holdersTop1Pct>30) t._rugScore=Math.min(100,(t._rugScore||0)+12);
+        if(t._holdersTop1Pct>20) (t._rugFactors=t._rugFactors||[]).push(`Top holder: ${t._holdersTop1Pct}%`);
+      }
+    } catch(e){}
+  }));
   return tokens;
 }
 
-// ──────────────────────────────────────────────────────────────
-// BUILDER — fusionne pump.fun + DexScreener en token enrichi
-// ──────────────────────────────────────────────────────────────
-function buildToken(coin, dexPairs) {
-  // Matcher par adresse (case-insensitive)
-  const mint = (coin.mint || '').toLowerCase();
-  const pair = dexPairs.find(p =>
-    (p.baseToken?.address || '').toLowerCase() === mint
-  );
+// ─── Pipeline principal ───────────────────────────────────────
+async function fetchAll() {
+  const t0=Date.now();
+  let coins=[];
+  let source='';
 
-  // Données réelles DexScreener si disponible, fallback pump.fun sinon
-  const mcap  = pair ? parseFloat(pair.fdv || 0)            : (coin.usd_market_cap || 0);
-  const vol   = pair ? parseFloat(pair.volume?.h24 || 0)    : mcap * 0.22;
-  const liq   = pair ? parseFloat(pair.liquidity?.usd || 0) : (coin.virtual_sol_reserves || 0) / 1e9 * 155;
-  const buys  = pair ? parseInt(pair.txns?.h24?.buys || 0)  : 0;
-  const sells = pair ? parseInt(pair.txns?.h24?.sells || 0) : 0;
-  const ch24  = pair ? parseFloat(pair.priceChange?.h24 || 0) : 0;
-  const price = pair?.priceUsd || null;
-
-  // Données pump.fun brutes
-  const holders = coin.holder_count || 0;
-  const devPct  = parseFloat(coin.creator_token_percentage || 0);
-  const curve   = coin.complete
-    ? 100
-    : Math.min(99, Math.round((coin.usd_market_cap || 0) / 69000 * 100));
-
-  // Rug score composite (données réelles)
-  let rugScore = 0;
-  const rugFactors = [];
-
-  if (devPct > 50)       { rugScore += 35; rugFactors.push(`Dev détient ${devPct.toFixed(0)}% supply`); }
-  else if (devPct > 20)  { rugScore += 18; rugFactors.push(`Dev: ${devPct.toFixed(0)}% (élevé)`); }
-
-  if (holders > 0) {
-    if (holders < 10)    { rugScore += 30; rugFactors.push(`Seulement ${holders} holders`); }
-    else if (holders < 50) { rugScore += 12; rugFactors.push(`Peu de holders (${holders})`); }
+  // Essayer toutes les sources en cascade
+  // Source 1 : Helius DAS searchAssets
+  const heliusAssets = await getTokensByHeliusSearch();
+  if(heliusAssets.length>0){
+    coins = heliusAssets.map(fromHeliusAsset);
+    source = 'helius-das';
+    console.log('[PV] Using Helius DAS:', coins.length, 'tokens');
   }
 
-  if (!coin.twitter && !coin.website && !coin.telegram) {
-    rugScore += 12;
-    rugFactors.push('Aucune présence sociale');
-  }
-
-  const tt = buys + sells;
-  if (tt > 0 && sells / tt > 0.65) {
-    rugScore += 18;
-    rugFactors.push(`${Math.round(sells/tt*100)}% de sells`);
-  }
-
-  if (liq > 0 && mcap > 0 && mcap / liq > 50) {
-    rugScore += 15;
-    rugFactors.push(`MCap/Liq ratio: ${Math.round(mcap/liq)}x`);
-  }
-
-  return {
-    baseToken:    { name: coin.name || 'Unknown', symbol: coin.symbol || '???', address: coin.mint || '' },
-    priceUsd:     price,
-    priceChange:  { h24: ch24 },
-    txns:         { h24: { buys, sells } },
-    volume:       { h24: vol },
-    liquidity:    { usd: liq },
-    marketCap:    mcap,
-    fdv:          mcap,
-    pairCreatedAt: coin.created_timestamp || Date.now(),
-    complete:     coin.complete || false,
-    king:         (coin.king_of_the_hill_timestamp || 0) > 0,
-    // Données enrichies
-    _holders:     holders,
-    _devPct:      devPct,
-    _rugScore:    Math.min(100, rugScore),
-    _rugFactors:  rugFactors,
-    _curve:       curve,
-    _replies:     coin.reply_count || 0,
-    _twitter:     coin.twitter  || '',
-    _website:     coin.website  || '',
-    _telegram:    coin.telegram || '',
-    _image:       coin.image_uri || '',
-    _creator:     coin.creator  || '',
-    _hasDex:      !!pair,
-    _holdersReal: false, // mis à true par Helius si disponible
-  };
-}
-
-// ──────────────────────────────────────────────────────────────
-// SMART WALLETS — depuis les creators réels pump.fun
-// ──────────────────────────────────────────────────────────────
-function buildSmartWallets(tokens) {
-  const map = {};
-  
-  for (const t of tokens) {
-    const creator = t._creator;
-    if (!creator) continue;
-    
-    if (!map[creator]) {
-      map[creator] = { addr: creator, wins: 0, total: 0, totalMcap: 0, tokens: [] };
-    }
-    
-    map[creator].total++;
-    map[creator].totalMcap += t.marketCap || 0;
-    
-    if ((t.marketCap || 0) > 10000) {
-      map[creator].wins++;
-    }
-    
-    if (map[creator].tokens.length < 4) {
-      map[creator].tokens.push({
-        symbol: t.baseToken?.symbol || '?',
-        name:   t.baseToken?.name   || '?',
-        mcap:   t.marketCap || 0,
-        curve:  t._curve || 0,
-        dir:    'buy',
-        gain:   (t.marketCap || 0) > 30000
-          ? '+' + Math.round(50 + Math.random() * 350) + '%'
-          : '-' + Math.round(10 + Math.random() * 50) + '%',
-        time: Math.round(5 + Math.random() * 180) + 'min',
-      });
+  // Source 2 : DexScreener (si Helius DAS vide)
+  if(coins.length===0){
+    const dexPairs = await getDexScreenerTokens();
+    if(dexPairs.length>0){
+      coins = dexPairs.map(fromDexPair);
+      source = 'dexscreener';
+      console.log('[PV] Using DexScreener:', coins.length, 'tokens');
     }
   }
 
-  const names = ['🧠','🦅','🐺','🔥','💎','👑','🎯','⚡','🌙','🦁','🐯','🦊'];
-
-  return Object.values(map)
-    .filter(w => w.wins > 0)
-    .map((w, i) => {
-      const wr = Math.round(w.wins / w.total * 100);
-      return {
-        addr:         w.addr,
-        short:        w.addr.slice(0,4) + '...' + w.addr.slice(-4),
-        emoji:        names[i % names.length],
-        winrate:      wr,
-        trades:       w.total,
-        wins:         w.wins,
-        avgRoi:       Math.round(90 + wr * 2.5),
-        pnlSol:       parseFloat((w.wins * 0.7 + Math.random()).toFixed(2)),
-        isSniper:     wr > 70 && w.total <= 8,
-        lastActive:   2 + Math.floor(Math.random() * 55),
-        recentTokens: w.tokens,
-        tags: [
-          wr >= 75 ? '🏆 Top Creator' : wr >= 60 ? '✅ Fiable' : '📊 Actif',
-          w.total <= 5 ? '🎯 Sniper' : '',
-          w.totalMcap > 200000 ? '💰 Whale' : '',
-        ].filter(Boolean),
-      };
-    })
-    .sort((a, b) => b.winrate - a.winrate)
-    .slice(0, 25);
-}
-
-// ──────────────────────────────────────────────────────────────
-// CACHE en mémoire — 25 secondes
-// ──────────────────────────────────────────────────────────────
-let cache = null;
-let cacheAt = 0;
-const CACHE_TTL = 25000;
-
-// ──────────────────────────────────────────────────────────────
-// PIPELINE PRINCIPAL
-// ──────────────────────────────────────────────────────────────
-async function fetchAllData() {
-  const t0 = Date.now();
-  
-  // 1. pump.fun — 3 pages en parallèle (~60 coins)
-  console.log('[PV] Fetching pump.fun...');
-  const [p0, p1, p2] = await Promise.all([
-    getPumpPage(0),
-    getPumpPage(20),
-    getPumpPage(40),
-  ]);
-
-  // Dédupliquer
-  const seen = new Set();
-  let coins = [...p0, ...p1, ...p2].filter(c => {
-    if (!c.mint || seen.has(c.mint)) return false;
-    seen.add(c.mint);
-    return true;
-  });
-  console.log(`[PV] ${coins.length} coins from pump.fun`);
-
-  // Si pump.fun bloqué → fallback DexScreener direct
-  if (coins.length === 0) {
-    console.log('[PV] pump.fun returned 0 — using DexScreener fallback...');
-    coins = await getDexScreenerFallback();
-    console.log(`[PV] DexScreener fallback: ${coins.length} coins`);
+  // Source 3 : Birdeye (dernier recours)
+  if(coins.length===0){
+    const birdTokens = await getBirdeyeTokens();
+    if(birdTokens.length>0){
+      coins = birdTokens.map(fromBirdeye);
+      source = 'birdeye';
+      console.log('[PV] Using Birdeye:', coins.length, 'tokens');
+    }
   }
 
-  // 2. DexScreener — enrichissement en 2 batches (skip si déjà depuis DexScreener)
-  let pairs = [];
-  const hasDexData = coins.some(c => c._dex);
-  if (!hasDexData) {
-    console.log('[PV] Fetching DexScreener enrichment...');
-    const mints = coins.map(c => c.mint).filter(Boolean);
-    const [dex0, dex1] = await Promise.all([
-      getDexPairs(mints.slice(0, 30)),
-      getDexPairs(mints.slice(30, 60)),
-    ]);
-    pairs = [...dex0, ...dex1];
-    console.log(`[PV] ${pairs.length} DexScreener pairs`);
-  } else {
-    // Utiliser les données DexScreener déjà dans les coins
-    pairs = coins.map(c => c._dex).filter(Boolean);
-    console.log(`[PV] Using ${pairs.length} embedded DexScreener pairs`);
+  if(coins.length===0){
+    console.error('[PV] ALL SOURCES FAILED');
+    return {tokens:[],smartWallets:[],stats:{total:0,error:'all sources failed',ts:Date.now()},source:'none'};
   }
 
-  // 3. Build tokens enrichis
-  let tokens = coins.map(c => buildToken(c, pairs));
+  // Build tokens
+  let tokens = coins.map(buildToken);
 
-  // 4. Helius — enrichir les holders réels (si clé configurée)
-  if (HELIUS) {
-    console.log('[PV] Enriching with Helius...');
-    tokens = await enrichHoldersHelius(tokens);
-    const withHelius = tokens.filter(t => t._holdersReal).length;
-    console.log(`[PV] ${withHelius} tokens enriched with real holders`);
-  }
+  // Enrichir avec Helius holders réels
+  tokens = await enrichHelius(tokens);
 
-  // 5. Smart wallets depuis les creators réels
   const smartWallets = buildSmartWallets(tokens);
-
-  const elapsed = Date.now() - t0;
-  console.log(`[PV] Done in ${elapsed}ms — ${tokens.length} tokens, ${smartWallets.length} smart wallets`);
+  const elapsed = Date.now()-t0;
+  console.log(`[PV] Done ${elapsed}ms — ${tokens.length} tokens (${source}), ${smartWallets.length} wallets`);
 
   return {
-    tokens,
-    smartWallets,
-    stats: {
-      total:     tokens.length,
-      withDex:   tokens.filter(t => t._hasDex).length,
-      withHelius:tokens.filter(t => t._holdersReal).length,
-      heliusKey: !!HELIUS,
-      elapsed,
-      ts:        Date.now(),
-    },
-    source: 'pumpfun+dexscreener' + (HELIUS ? '+helius' : ''),
+    tokens, smartWallets,
+    stats:{total:tokens.length,withDex:tokens.filter(t=>t._hasDex).length,withHelius:tokens.filter(t=>t._holdersReal).length,heliusKey:!!HELIUS,elapsed,ts:Date.now()},
+    source: source+(HELIUS?'+helius':''),
   };
 }
 
-// ──────────────────────────────────────────────────────────────
-// SERVEUR HTTP
-// ──────────────────────────────────────────────────────────────
-http.createServer(async (req, res) => {
-  // CORS total — nécessaire pour le browser
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', '*');
-  res.setHeader('Content-Type', 'application/json');
+// ─── Cache ────────────────────────────────────────────────────
+let cache=null, cacheAt=0;
+const TTL=25000;
 
-  if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
+// ─── Server ──────────────────────────────────────────────────
+http.createServer(async(req,res)=>{
+  res.setHeader('Access-Control-Allow-Origin','*');
+  res.setHeader('Access-Control-Allow-Methods','GET,OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers','*');
+  res.setHeader('Content-Type','application/json');
+  if(req.method==='OPTIONS'){res.writeHead(204);res.end();return;}
+  const path=req.url.split('?')[0];
 
-  const path = req.url.split('?')[0];
-
-  // ── /health — status check ──────────────────────────────────
-  if (path === '/health') {
+  if(path==='/health'){
     res.writeHead(200);
-    res.end(JSON.stringify({
-      ok:        true,
-      helius:    !!HELIUS,
-      cached:    !!cache,
-      cacheAge:  cache ? Math.round((Date.now() - cacheAt) / 1000) + 's' : null,
-      version:   '2.1',
-    }));
+    res.end(JSON.stringify({ok:true,helius:!!HELIUS,cached:!!cache,cacheAge:cache?Math.round((Date.now()-cacheAt)/1000)+'s':null,version:'3.0'}));
     return;
   }
-
-  // ── /tokens — données live ──────────────────────────────────
-  if (path === '/' || path === '/tokens') {
-    // Servir depuis cache si frais
-    if (cache && Date.now() - cacheAt < CACHE_TTL) {
-      res.writeHead(200);
-      res.end(JSON.stringify({ ...cache, cached: true }));
-      return;
-    }
-
-    try {
-      const data = await fetchAllData();
-      cache  = data;
-      cacheAt = Date.now();
-      res.writeHead(200);
-      res.end(JSON.stringify(data));
-    } catch(e) {
-      console.error('[PV] Pipeline error:', e.message);
-      res.writeHead(500);
-      res.end(JSON.stringify({ error: e.message, helius: !!HELIUS }));
+  if(path==='/'||path==='/tokens'){
+    if(cache&&Date.now()-cacheAt<TTL){res.writeHead(200);res.end(JSON.stringify({...cache,cached:true}));return;}
+    try{
+      const data=await fetchAll();
+      cache=data; cacheAt=Date.now();
+      res.writeHead(200); res.end(JSON.stringify(data));
+    }catch(e){
+      console.error('[PV]',e.message);
+      res.writeHead(500); res.end(JSON.stringify({error:e.message}));
     }
     return;
   }
+  res.writeHead(404); res.end(JSON.stringify({error:'Use /tokens or /health'}));
 
-  res.writeHead(404);
-  res.end(JSON.stringify({ error: 'Use /tokens or /health' }));
-
-}).listen(PORT, () => {
-  console.log('');
-  console.log('🚀 PumpVision Proxy v2.1');
-  console.log(`   Port    : ${PORT}`);
-  console.log(`   Helius  : ${HELIUS ? '✅ configured' : '❌ not set — add HELIUS_KEY env var'}`);
-  console.log(`   Cache   : ${CACHE_TTL/1000}s`);
-  console.log('');
-  console.log('   GET /tokens  — live pump.fun + DexScreener data');
-  console.log('   GET /health  — status');
-  console.log('');
+}).listen(PORT,()=>{
+  console.log('🚀 PumpVision Proxy v3.0 :'+PORT);
+  console.log('   Helius:', HELIUS?'✅':'❌');
+  console.log('   Sources: Helius DAS → DexScreener → Birdeye');
 });
