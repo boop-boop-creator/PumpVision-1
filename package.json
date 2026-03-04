@@ -1,0 +1,8 @@
+{
+  "name": "pumpvision-proxy",
+  "version": "2.0.0",
+  "description": "PumpVision live data proxy — pump.fun + DexScreener",
+  "main": "server.js",
+  "scripts": { "start": "node server.js" },
+  "engines": { "node": ">=18" }
+}
