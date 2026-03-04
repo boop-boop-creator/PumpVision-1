@@ -1,5 +1,5 @@
 // PumpVision Proxy v3.0 — Helius comme source principale
-// pump.fun + DexScreener bloquent Railway → on passe par Helius RPC
+// pump.fun + DexScreener blouent Railway → on passe par Helius RPC
 const http  = require('http');
 const https = require('https');
 const PORT  = process.env.PORT || 3000;
