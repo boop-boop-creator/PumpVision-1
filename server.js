@@ -256,7 +256,16 @@ function buildToken(coin) {
 
   const mcap  = dex ? parseFloat(dex.fdv||0)           : (bird ? bird.mc||0 : coin.usd_market_cap||0);
   const vol   = dex ? parseFloat(dex.volume?.h24||0)   : (bird ? bird.v24hUSD||0 : mcap*0.2);
-  const liq   = dex ? parseFloat(dex.liquidity?.usd||0): (bird ? bird.liquidity||0 : (coin.virtual_sol_reserves||0)/1e9*155);
+  // Liquidité DexScreener = 0 pour tokens en bonding curve (pas de pool AMM)
+  // Estimation depuis la bonding curve : la SOL lockée = mcap * curve% * 0.85
+  // Formula pump.fun : 85 SOL max lockés à graduation (~$69k mcap)
+  let liqRaw = dex ? parseFloat(dex.liquidity?.usd||0) : (bird ? bird.liquidity||0 : 0);
+  if (!liqRaw || liqRaw === 0) {
+    // Estimer depuis la bonding curve — pump.fun locke de la SOL proportionnellement
+    const solLocked = (mcap / 69000) * 85; // SOL lockés estimés
+    liqRaw = solLocked * 155; // → USD (prix SOL ~155)
+  }
+  const liq = liqRaw;
   const buys  = dex ? parseInt(dex.txns?.h24?.buys||0) : (bird ? Math.round((bird.trade24h||0)*0.6) : 0);
   const sells = dex ? parseInt(dex.txns?.h24?.sells||0): (bird ? Math.round((bird.trade24h||0)*0.4) : 0);
   const ch24  = dex ? parseFloat(dex.priceChange?.h24||0) : (bird ? bird.priceChange24hPercent||0 : 0);
