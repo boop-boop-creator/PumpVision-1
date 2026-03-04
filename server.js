@@ -365,6 +365,32 @@ async function fetchAll() {
   };
 }
 
+// ─── Chart OHLCV via DexScreener ─────────────────────────────
+async function getOHLCV(addr, res) {
+  // DexScreener chart endpoint — pas de CORS côté serveur
+  const urls = [
+    `https://io.dexscreener.com/dex/chart/amm/v3/${addr}?res=${res}&cb=1`,
+    `https://io.dexscreener.com/dex/chart/v3/${addr}?res=${res}&cb=1`,
+  ];
+  for (const url of urls) {
+    try {
+      const d = await get(url, {
+        'Referer':'https://dexscreener.com/',
+        'Origin':'https://dexscreener.com',
+        'Accept':'application/json',
+      });
+      if (d.bars && d.bars.length > 0) {
+        console.log(`[PV] Chart ${addr.slice(0,8)} res=${res}: ${d.bars.length} bars`);
+        return d.bars;
+      }
+    } catch(e) { console.warn('[PV] chart:', e.message); }
+  }
+  return [];
+}
+
+// Cache chart séparé (TTL 15s)
+const chartCache = {};
+
 // ─── Cache ────────────────────────────────────────────────────
 let cache=null, cacheAt=0;
 const TTL=25000;
@@ -395,7 +421,27 @@ http.createServer(async(req,res)=>{
     }
     return;
   }
-  res.writeHead(404); res.end(JSON.stringify({error:'Use /tokens or /health'}));
+  // ── /chart — OHLCV pour graphes ──────────────────────────────
+  if (path === '/chart') {
+    const params = new URL('http://x'+req.url).searchParams;
+    const addr = params.get('addr') || '';
+    const res2 = params.get('res') || '60';
+    if (!addr) { res.writeHead(400); res.end(JSON.stringify({error:'addr required'})); return; }
+    const ckey = addr+'-'+res2;
+    if (chartCache[ckey] && Date.now()-chartCache[ckey].ts < 15000) {
+      res.writeHead(200); res.end(JSON.stringify({bars:chartCache[ckey].bars, cached:true})); return;
+    }
+    try {
+      const bars = await getOHLCV(addr, res2);
+      chartCache[ckey] = {bars, ts:Date.now()};
+      res.writeHead(200); res.end(JSON.stringify({bars}));
+    } catch(e) {
+      res.writeHead(500); res.end(JSON.stringify({error:e.message, bars:[]}));
+    }
+    return;
+  }
+
+  res.writeHead(404); res.end(JSON.stringify({error:'Use /tokens, /chart or /health'}));
 
 }).listen(PORT,()=>{
   console.log('🚀 PumpVision Proxy v3.0 :'+PORT);
