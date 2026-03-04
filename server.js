@@ -98,72 +98,75 @@ async function getRecentPumpTransactions() {
 // ─── SOURCE 3 : DexScreener via Helius proxy headers ─────────
 // DexScreener bloque Railway IP mais accepte avec bon User-Agent
 async function getDexScreenerTokens() {
-  const urls = [
-    'https://api.dexscreener.com/latest/dex/search/?q=pump&rankBy=trendingScoreH6&order=desc',
-    'https://api.dexscreener.com/latest/dex/search/?q=pumpfun',
-  ];
-  for (const url of urls) {
-    try {
-      const d = await get(url, {
-        'Accept': 'application/json, text/plain, */*',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'Cache-Control': 'no-cache',
-      });
-      let pairs = (d.pairs || []).filter(p =>
-        p && p.chainId === 'solana' && (p.dexId === 'pumpfun' || !p.dexId)
-        && parseFloat(p.fdv || 0) > 0
-      );
-      if (pairs.length > 0) {
-        console.log('[PV] DexScreener search:', pairs.length, 'pairs');
-        // Enrichir la liquidité via /tokens/{mint} — retourne liquidity.usd réel
-        pairs = await enrichLiquidity(pairs);
+  const hdrs = {
+    'Accept': 'application/json',
+    'Accept-Language': 'en-US,en;q=0.9',
+    'Cache-Control': 'no-cache',
+    'Referer': 'https://dexscreener.com/',
+    'Origin': 'https://dexscreener.com',
+  };
+
+  // Endpoint 1 : trending tokens Solana (le plus fiable)
+  try {
+    const d = await get('https://api.dexscreener.com/token-boosts/latest/v1', hdrs);
+    const items = Array.isArray(d) ? d : [];
+    const solPairs = items.filter(t => t.chainId === 'solana').slice(0, 30);
+    if (solPairs.length >= 5) {
+      // Enrichir avec les vraies données de paire
+      const mints = solPairs.map(t => t.tokenAddress).filter(Boolean);
+      const pairs = await getDexPairsByMints(mints);
+      if (pairs.length >= 5) {
+        console.log('[PV] DexScreener boosts+pairs:', pairs.length, 'pairs');
         return pairs;
       }
-    } catch(e) { console.warn('[PV] DexScreener', url.slice(-30), e.message); }
-  }
+    }
+  } catch(e) { console.warn('[PV] boosts:', e.message); }
+
+  // Endpoint 2 : nouveaux tokens pump.fun via tokenlist
+  try {
+    const d = await get('https://api.dexscreener.com/latest/dex/tokens/So11111111111111111111111111111111111111112', hdrs);
+    const pairs = (d.pairs || [])
+      .filter(p => p.chainId === 'solana' && p.dexId === 'pumpfun' && parseFloat(p.fdv||0) > 500)
+      .slice(0, 40);
+    if (pairs.length >= 5) {
+      console.log('[PV] DexScreener SOL pairs:', pairs.length);
+      return pairs;
+    }
+  } catch(e) { console.warn('[PV] SOL pairs:', e.message); }
+
+  // Endpoint 3 : recherche par dex pumpfun directement
+  try {
+    const d = await get('https://api.dexscreener.com/latest/dex/search?q=sol%20pump', hdrs);
+    const pairs = (d.pairs || [])
+      .filter(p => p.chainId === 'solana' && parseFloat(p.fdv||0) > 500 && parseFloat(p.fdv||0) < 5000000)
+      .slice(0, 40);
+    if (pairs.length >= 3) {
+      console.log('[PV] DexScreener search sol pump:', pairs.length);
+      return pairs;
+    }
+  } catch(e) { console.warn('[PV] search:', e.message); }
+
   return [];
 }
 
-// Enrichir liquidité réelle via DexScreener /tokens/{mint}
-// Endpoint différent de /search — retourne liquidity.usd correct
-async function enrichLiquidity(pairs) {
-  // Grouper les mints par batch de 30
-  const mints = pairs.map(p => p.baseToken?.address).filter(Boolean);
+// Récupérer les paires par liste de mints (batch)
+async function getDexPairsByMints(mints) {
+  const results = [];
   const batches = [];
   for (let i = 0; i < mints.length; i += 30) batches.push(mints.slice(i, i+30));
-
-  const enriched = {};
-  await Promise.allSettled(batches.map(async (batch) => {
+  
+  await Promise.allSettled(batches.map(async batch => {
     try {
-      const d = await get(
-        'https://api.dexscreener.com/latest/dex/tokens/' + batch.join(',')
+      const d = await get('https://api.dexscreener.com/latest/dex/tokens/' + batch.join(','));
+      const pairs = (d.pairs || []).filter(p => 
+        p.chainId === 'solana' && parseFloat(p.fdv||0) > 500
       );
-      (d.pairs || []).forEach(p => {
-        const addr = p.baseToken?.address;
-        if (addr && parseFloat(p.liquidity?.usd || 0) > 0) {
-          enriched[addr] = p;
-        }
-      });
-    } catch(e) { console.warn('[PV] enrichLiquidity:', e.message); }
+      results.push(...pairs);
+    } catch(e) { console.warn('[PV] getDexPairsByMints:', e.message); }
   }));
-
-  // Merger les données enrichies
-  return pairs.map(p => {
-    const addr = p.baseToken?.address;
-    const rich = enriched[addr];
-    if (rich) {
-      return {
-        ...p,
-        liquidity: rich.liquidity,      // ✅ vraie liquidité
-        txns:      rich.txns || p.txns,
-        volume:    rich.volume || p.volume,
-        priceChange: rich.priceChange || p.priceChange,
-        priceUsd:  rich.priceUsd || p.priceUsd,
-      };
-    }
-    return p;
-  });
+  return results;
 }
+
 
 // ─── SOURCE 4 : Birdeye API (accepte les serveurs) ───────────
 async function getBirdeyeTokens() {
@@ -256,14 +259,15 @@ function buildToken(coin) {
 
   const mcap  = dex ? parseFloat(dex.fdv||0)           : (bird ? bird.mc||0 : coin.usd_market_cap||0);
   const vol   = dex ? parseFloat(dex.volume?.h24||0)   : (bird ? bird.v24hUSD||0 : mcap*0.2);
-  // Liquidité DexScreener = 0 pour tokens en bonding curve (pas de pool AMM)
-  // Estimation depuis la bonding curve : la SOL lockée = mcap * curve% * 0.85
-  // Formula pump.fun : 85 SOL max lockés à graduation (~$69k mcap)
+  // Liquidité : utiliser la SOL réelle de la bonding curve
+  // pump.fun : à graduation ($69k mcap), 85 SOL sont lockés dans la curve
+  // Formule linéaire précise : sol_locked = curve_pct/100 * 85
   let liqRaw = dex ? parseFloat(dex.liquidity?.usd||0) : (bird ? bird.liquidity||0 : 0);
-  if (!liqRaw || liqRaw === 0) {
-    // Estimer depuis la bonding curve — pump.fun locke de la SOL proportionnellement
-    const solLocked = (mcap / 69000) * 85; // SOL lockés estimés
-    liqRaw = solLocked * 155; // → USD (prix SOL ~155)
+  if (!liqRaw || liqRaw < 10) {
+    const curvePct = Math.min(coin.complete ? 100 : Math.min(99, Math.round(mcap/69000*100)), 100);
+    const solPrice = 155; // Prix SOL approximatif
+    const solLocked = (curvePct / 100) * 85;
+    liqRaw = Math.round(solLocked * solPrice * 100) / 100;
   }
   const liq = liqRaw;
   const buys  = dex ? parseInt(dex.txns?.h24?.buys||0) : (bird ? Math.round((bird.trade24h||0)*0.6) : 0);
@@ -414,25 +418,55 @@ async function fetchAll() {
 
 // ─── Chart OHLCV via DexScreener ─────────────────────────────
 async function getOHLCV(addr, res) {
-  // DexScreener chart endpoint — pas de CORS côté serveur
-  const urls = [
-    `https://io.dexscreener.com/dex/chart/amm/v3/${addr}?res=${res}&cb=1`,
-    `https://io.dexscreener.com/dex/chart/v3/${addr}?res=${res}&cb=1`,
-  ];
-  for (const url of urls) {
-    try {
-      const d = await get(url, {
-        'Referer':'https://dexscreener.com/',
-        'Origin':'https://dexscreener.com',
-        'Accept':'application/json',
-      });
-      if (d.bars && d.bars.length > 0) {
-        console.log(`[PV] Chart ${addr.slice(0,8)} res=${res}: ${d.bars.length} bars`);
-        return d.bars;
-      }
-    } catch(e) { console.warn('[PV] chart:', e.message); }
+  // DexScreener chart bloqué 403 — utiliser Helius transactions directement
+  if (HELIUS) {
+    const bars = await getHeliumBars(addr, res);
+    if (bars.length >= 3) return bars;
   }
   return [];
+}
+
+
+// Bougies synthétiques depuis les transactions Helius
+async function getHeliumBars(mint, res) {
+  try {
+    const txns = await get(
+      `https://api.helius.xyz/v0/addresses/${mint}/transactions?api-key=${HELIUS}&limit=100&type=SWAP`
+    );
+    if (!Array.isArray(txns) || txns.length < 2) return [];
+
+    // Grouper les transactions par intervalle de temps
+    const intervalMs = parseInt(res) * 60 * 1000;
+    const now = Date.now();
+    const groups = {};
+
+    txns.forEach(tx => {
+      const ts = (tx.timestamp || 0) * 1000;
+      const bucket = Math.floor(ts / intervalMs) * intervalMs;
+      if (!groups[bucket]) groups[bucket] = [];
+      // Extraire le prix depuis les token transfers
+      const nativeAmt = Math.abs(tx.nativeTransfers?.[0]?.amount || 0) / 1e9;
+      const tokenAmt  = Math.abs(tx.tokenTransfers?.[0]?.tokenAmount || 0);
+      if (nativeAmt > 0 && tokenAmt > 0) {
+        groups[bucket].push(nativeAmt / tokenAmt * 155); // prix en USD
+      }
+    });
+
+    const bars = Object.entries(groups)
+      .filter(([,prices]) => prices.length > 0)
+      .sort(([a],[b]) => a-b)
+      .map(([ts, prices]) => {
+        const o = prices[0], c = prices[prices.length-1];
+        const h = Math.max(...prices), l = Math.min(...prices);
+        return { t: parseInt(ts)/1000, o, h, l, c };
+      });
+
+    console.log(`[PV] Helius bars for ${mint.slice(0,8)}: ${bars.length} bars`);
+    return bars;
+  } catch(e) {
+    console.warn('[PV] Helius bars failed:', e.message);
+    return [];
+  }
 }
 
 // Cache chart séparé (TTL 15s)
