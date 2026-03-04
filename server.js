@@ -45,17 +45,80 @@ function get(url, extraHeaders = {}) {
 }
 
 // ──────────────────────────────────────────────────────────────
-// SOURCE 1 : pump.fun — coins récents
+// SOURCE 1 : pump.fun API — plusieurs variantes pour contourner les blocks
 // ──────────────────────────────────────────────────────────────
 async function getPumpPage(offset = 0) {
+  // Variante A : frontend-api classique
   try {
     const coins = await get(
       `https://frontend-api.pump.fun/coins?offset=${offset}&limit=20&sort=last_trade_timestamp&order=DESC&includeNsfw=false`,
-      { Referer: 'https://pump.fun/', Origin: 'https://pump.fun' }
+      {
+        'Referer': 'https://pump.fun/',
+        'Origin': 'https://pump.fun',
+        'Accept': 'application/json',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Cache-Control': 'no-cache',
+      }
     );
-    return Array.isArray(coins) ? coins : [];
+    if (Array.isArray(coins) && coins.length > 0) return coins;
   } catch(e) {
-    console.warn(`[PV] pump.fun offset=${offset} failed:`, e.message);
+    console.warn(`[PV] pump.fun v1 offset=${offset}:`, e.message);
+  }
+
+  // Variante B : client-api-v2
+  try {
+    const coins = await get(
+      `https://client-api-2-74b1891ee9f9.herokuapp.com/coins?offset=${offset}&limit=20&sort=last_trade_timestamp&order=DESC&includeNsfw=false`,
+      { 'Referer': 'https://pump.fun/', 'Origin': 'https://pump.fun' }
+    );
+    if (Array.isArray(coins) && coins.length > 0) return coins;
+  } catch(e) {
+    console.warn(`[PV] pump.fun v2 offset=${offset}:`, e.message);
+  }
+
+  return [];
+}
+
+// ──────────────────────────────────────────────────────────────
+// SOURCE 1b : DexScreener — fallback si pump.fun bloqué
+// Retourne des tokens au format compatible buildToken()
+// ──────────────────────────────────────────────────────────────
+async function getDexScreenerFallback() {
+  try {
+    // Recherche tokens pump.fun récents sur DexScreener
+    const data = await get('https://api.dexscreener.com/latest/dex/search/?q=pump&rankBy=trendingScoreH6&order=desc');
+    const pairs = (data.pairs || []).filter(p =>
+      p.chainId === 'solana' &&
+      p.dexId === 'pumpfun' &&
+      parseFloat(p.fdv || 0) < 2000000 &&
+      parseFloat(p.fdv || 0) > 100
+    ).slice(0, 50);
+
+    console.log('[PV] DexScreener fallback:', pairs.length, 'pairs');
+
+    // Convertir en format pseudo-pump.fun pour buildToken()
+    return pairs.map(p => ({
+      mint:                    p.baseToken?.address || '',
+      name:                    p.baseToken?.name || 'Unknown',
+      symbol:                  p.baseToken?.symbol || '???',
+      usd_market_cap:          parseFloat(p.fdv || 0),
+      virtual_sol_reserves:    parseFloat(p.liquidity?.usd || 0) / 155 * 1e9,
+      created_timestamp:       p.pairCreatedAt || Date.now(),
+      complete:                false,
+      king_of_the_hill_timestamp: 0,
+      reply_count:             parseInt(p.txns?.h24?.buys || 0),
+      holder_count:            0,
+      creator_token_percentage:0,
+      creator:                 p.baseToken?.address?.slice(0,44) || '',
+      twitter:                 '',
+      website:                 '',
+      telegram:                '',
+      image_uri:               p.info?.imageUrl || '',
+      // Données DexScreener déjà enrichies — on les garde
+      _dex: p,
+    }));
+  } catch(e) {
+    console.warn('[PV] DexScreener fallback failed:', e.message);
     return [];
   }
 }
@@ -313,25 +376,40 @@ async function fetchAllData() {
     getPumpPage(20),
     getPumpPage(40),
   ]);
-  
+
   // Dédupliquer
   const seen = new Set();
-  const coins = [...p0, ...p1, ...p2].filter(c => {
+  let coins = [...p0, ...p1, ...p2].filter(c => {
     if (!c.mint || seen.has(c.mint)) return false;
     seen.add(c.mint);
     return true;
   });
   console.log(`[PV] ${coins.length} coins from pump.fun`);
 
-  // 2. DexScreener — enrichissement en 2 batches
-  console.log('[PV] Fetching DexScreener...');
-  const mints = coins.map(c => c.mint).filter(Boolean);
-  const [dex0, dex1] = await Promise.all([
-    getDexPairs(mints.slice(0, 30)),
-    getDexPairs(mints.slice(30, 60)),
-  ]);
-  const pairs = [...dex0, ...dex1];
-  console.log(`[PV] ${pairs.length} DexScreener pairs`);
+  // Si pump.fun bloqué → fallback DexScreener direct
+  if (coins.length === 0) {
+    console.log('[PV] pump.fun returned 0 — using DexScreener fallback...');
+    coins = await getDexScreenerFallback();
+    console.log(`[PV] DexScreener fallback: ${coins.length} coins`);
+  }
+
+  // 2. DexScreener — enrichissement en 2 batches (skip si déjà depuis DexScreener)
+  let pairs = [];
+  const hasDexData = coins.some(c => c._dex);
+  if (!hasDexData) {
+    console.log('[PV] Fetching DexScreener enrichment...');
+    const mints = coins.map(c => c.mint).filter(Boolean);
+    const [dex0, dex1] = await Promise.all([
+      getDexPairs(mints.slice(0, 30)),
+      getDexPairs(mints.slice(30, 60)),
+    ]);
+    pairs = [...dex0, ...dex1];
+    console.log(`[PV] ${pairs.length} DexScreener pairs`);
+  } else {
+    // Utiliser les données DexScreener déjà dans les coins
+    pairs = coins.map(c => c._dex).filter(Boolean);
+    console.log(`[PV] Using ${pairs.length} embedded DexScreener pairs`);
+  }
 
   // 3. Build tokens enrichis
   let tokens = coins.map(c => buildToken(c, pairs));
