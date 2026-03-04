@@ -101,7 +101,6 @@ async function getDexScreenerTokens() {
   const urls = [
     'https://api.dexscreener.com/latest/dex/search/?q=pump&rankBy=trendingScoreH6&order=desc',
     'https://api.dexscreener.com/latest/dex/search/?q=pumpfun',
-    'https://api.dexscreener.com/token-boosts/latest/v1',
   ];
   for (const url of urls) {
     try {
@@ -109,22 +108,61 @@ async function getDexScreenerTokens() {
         'Accept': 'application/json, text/plain, */*',
         'Accept-Language': 'en-US,en;q=0.9',
         'Cache-Control': 'no-cache',
-        'Pragma': 'no-cache',
-        'sec-fetch-dest': 'empty',
-        'sec-fetch-mode': 'cors',
-        'sec-fetch-site': 'cross-site',
       });
-      const pairs = (d.pairs || d || []).filter(p =>
+      let pairs = (d.pairs || []).filter(p =>
         p && p.chainId === 'solana' && (p.dexId === 'pumpfun' || !p.dexId)
-        && parseFloat(p.fdv||p.tokenAddress||0) > 0
+        && parseFloat(p.fdv || 0) > 0
       );
       if (pairs.length > 0) {
-        console.log('[PV] DexScreener OK:', pairs.length, 'pairs from', url.split('?')[0].split('/').pop());
+        console.log('[PV] DexScreener search:', pairs.length, 'pairs');
+        // Enrichir la liquidité via /tokens/{mint} — retourne liquidity.usd réel
+        pairs = await enrichLiquidity(pairs);
         return pairs;
       }
     } catch(e) { console.warn('[PV] DexScreener', url.slice(-30), e.message); }
   }
   return [];
+}
+
+// Enrichir liquidité réelle via DexScreener /tokens/{mint}
+// Endpoint différent de /search — retourne liquidity.usd correct
+async function enrichLiquidity(pairs) {
+  // Grouper les mints par batch de 30
+  const mints = pairs.map(p => p.baseToken?.address).filter(Boolean);
+  const batches = [];
+  for (let i = 0; i < mints.length; i += 30) batches.push(mints.slice(i, i+30));
+
+  const enriched = {};
+  await Promise.allSettled(batches.map(async (batch) => {
+    try {
+      const d = await get(
+        'https://api.dexscreener.com/latest/dex/tokens/' + batch.join(',')
+      );
+      (d.pairs || []).forEach(p => {
+        const addr = p.baseToken?.address;
+        if (addr && parseFloat(p.liquidity?.usd || 0) > 0) {
+          enriched[addr] = p;
+        }
+      });
+    } catch(e) { console.warn('[PV] enrichLiquidity:', e.message); }
+  }));
+
+  // Merger les données enrichies
+  return pairs.map(p => {
+    const addr = p.baseToken?.address;
+    const rich = enriched[addr];
+    if (rich) {
+      return {
+        ...p,
+        liquidity: rich.liquidity,      // ✅ vraie liquidité
+        txns:      rich.txns || p.txns,
+        volume:    rich.volume || p.volume,
+        priceChange: rich.priceChange || p.priceChange,
+        priceUsd:  rich.priceUsd || p.priceUsd,
+      };
+    }
+    return p;
+  });
 }
 
 // ─── SOURCE 4 : Birdeye API (accepte les serveurs) ───────────
